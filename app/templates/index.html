@@ -29,6 +29,14 @@
 </div>
 
 <div class="card">
+  <h2>上下游时差分析（预警模型候选提前量）</h2>
+  <p>选择上游站、下游站、UTC 起止整点与 1～6 小时最大时差，按共同可配对的可供数小时雨量，
+     比较 0～最大时差各候选的皮尔逊相关系数（上游小时与下游延后小时配对）。</p>
+  <p><a href="{{ url_for('lag_html') }}"><button type="button">进入时差分析</button></a>
+     等效 API：<code>GET /api/lag?upstream=..&amp;downstream=..&amp;start=..&amp;end=..&amp;max_lag=3</code></p>
+</div>
+
+<div class="card">
   <h2>站点数据</h2>
   {% if stations %}
   <table>

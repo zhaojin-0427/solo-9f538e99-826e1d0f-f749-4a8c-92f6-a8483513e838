@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 SCHEMA = """
@@ -159,6 +160,33 @@ def fetch_hour_counters(conn: sqlite3.Connection, station: str, hour_start_epoch
         (station, hour_start_epoch, hour_start_epoch + 3600),
     ).fetchall()
     return {(r["device"], r["minute_epoch"]): r["counter"] for r in rows}
+
+
+def fetch_range_counters(conn: sqlite3.Connection, station: str,
+                         start_epoch: int, end_epoch: int) -> dict:
+    """取某站 [start_epoch, end_epoch] 分钟端点的全部读数（含两端）。"""
+    rows = conn.execute(
+        "SELECT device, minute_epoch, counter FROM readings"
+        " WHERE station=? AND minute_epoch BETWEEN ? AND ?",
+        (station, start_epoch, end_epoch),
+    ).fetchall()
+    return {(r["device"], r["minute_epoch"]): r["counter"] for r in rows}
+
+
+@contextmanager
+def snapshot_read(conn: sqlite3.Connection):
+    """只读快照事务：事务内的所有查询取自同一个已提交状态。
+
+    连接为 autocommit（isolation_level=None），这里显式 BEGIN 一个
+    延迟事务；读事务不与写入互斥，但在事务期间不会看到后续提交的新数据，
+    因此补传与查询交错时，一次查询里两站及各候选读数状态一致。
+    与写入事务（BEGIN IMMEDIATE）不同，这里不会阻塞其他连接提交。
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        conn.execute("COMMIT")
 
 
 def list_stations(conn: sqlite3.Connection):

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +24,10 @@ COUNTER_MOD = 10000       # 翻斗计数器量程（0~9999，回绕一次加 100
 INTERVALS_PER_HOUR = 60   # 每小时 60 个相邻分钟间隔
 MINUTE_SECONDS = 60
 HOUR_SECONDS = 3600
+
+MIN_PAIRS = 8             # 候选时差判定所需的最少配对小时数
+MAX_LAG_LIMIT = 6         # 允许的最大时差（小时）
+TIE_EPS = 1e-9            # 最高系数并列判定容差
 
 DEVICE_PRIMARY = "primary"
 DEVICE_BACKUP = "backup"
@@ -285,3 +290,149 @@ def compute_hour(counters: dict, station: str, hour_start_epoch: int) -> dict:
         "source_counts": source_counts,
         "intervals": intervals,
     }
+
+
+# ---------------- 上下游时差（候选提前量）分析 ----------------
+
+def pearson(xs: list[float], ys: list[float]):
+    """皮尔逊相关系数；任一序列无波动（方差为 0）时返回 None。"""
+    n = len(xs)
+    if n != len(ys) or n == 0:
+        raise ValueError("两序列长度必须一致且非空")
+    mx = math.fsum(xs) / n
+    my = math.fsum(ys) / n
+    sxx = math.fsum((x - mx) ** 2 for x in xs)
+    syy = math.fsum((y - my) ** 2 for y in ys)
+    if sxx <= 0.0 or syy <= 0.0:
+        return None  # 任一序列无波动，相关系数无定义
+    sxy = math.fsum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    r = sxy / math.sqrt(sxx * syy)
+    # 浮点误差可能略微越界，夹回 [-1, 1]
+    return max(-1.0, min(1.0, r))
+
+
+def build_hour_rainfall(counters: dict, station: str,
+                        window_start: int, window_end: int) -> dict:
+    """把某站在 [window_start, window_end] 各整点小时现算为可供数小时雨量。
+
+    仅保留 status=ok（60 个间隔全部有可用数据）的小时；
+    返回 {hour_epoch: rainfall_mm}，不可供数的小时不进入序列。
+    """
+    out = {}
+    for hour in range(window_start, window_end + 1, HOUR_SECONDS):
+        result = compute_hour(counters, station, hour)
+        if result["status"] == "ok":
+            out[hour] = result["rainfall_mm"]
+    return out
+
+
+def analyze_lag(up_rain: dict, down_rain: dict,
+                window_start: int, window_end: int, max_lag: int) -> dict:
+    """按候选提前量 0~max_lag 比较上、下游可供数小时雨量的皮尔逊相关系数。
+
+    配对方式：上游小时 h 与下游小时 h+lag（下游延后 lag 小时）。
+    所有候选只用共同可配对的上游小时——即对 0~max_lag 每个时差都能配上、
+    且配对双方都在窗口内的上游小时，保证各候选的配对集合完全相同、可横向比较。
+
+    up_rain / down_rain: {hour_epoch: rainfall_mm}，只含可供数小时。
+    返回的 dict 同时供网页展示与 API 输出，两边结果一致。
+    """
+    if window_start % HOUR_SECONDS != 0 or window_end % HOUR_SECONDS != 0:
+        raise ValueError("窗口起止必须整点对齐")
+    if not isinstance(max_lag, int) or not 1 <= max_lag <= MAX_LAG_LIMIT:
+        raise ValueError(f"max_lag 必须为 1~{MAX_LAG_LIMIT} 的整数")
+    if window_end < window_start:
+        raise ValueError("结束整点不能早于起始整点")
+
+    # 共同可配对的上游小时：h 与 h+0..max_lag 全部落在窗口内，
+    # 且上游 h、下游 h+lag 对每个 lag 都是可供数小时
+    last_up = window_end - max_lag * HOUR_SECONDS
+    common_hours = sorted(
+        h for h in range(window_start, last_up + 1, HOUR_SECONDS)
+        if h in up_rain
+        and all(h + lag * HOUR_SECONDS in down_rain for lag in range(max_lag + 1))
+    )
+    pair_count = len(common_hours)
+
+    candidates = []
+    for lag in range(max_lag + 1):
+        xs = [up_rain[h] for h in common_hours]
+        ys = [down_rain[h + lag * HOUR_SECONDS] for h in common_hours]
+        if pair_count < MIN_PAIRS:
+            r = None  # 配对不足，不计算系数
+        else:
+            r = pearson(xs, ys)
+        candidates.append({
+            "lag_hours": lag,
+            "coefficient": round(r, 4) if r is not None else None,
+            "defined": r is not None,
+            "pair_count": pair_count,
+            "pairs": [
+                {
+                    "upstream_hour": iso_utc(h),
+                    "downstream_hour": iso_utc(h + lag * HOUR_SECONDS),
+                    "upstream_mm": up_rain[h],
+                    "downstream_mm": down_rain[h + lag * HOUR_SECONDS],
+                }
+                for h in common_hours
+            ],
+        })
+
+    if pair_count < MIN_PAIRS:
+        conclusion, reason = "无法判断", "insufficient_pairs"
+    else:
+        defined = [c for c in candidates if c["defined"]]
+        if not defined:
+            conclusion, reason = "无法判断", "no_variation"
+        else:
+            best = max(c["coefficient"] for c in defined)
+            if best <= 0:
+                conclusion, reason = "无法判断", "non_positive"
+            else:
+                # 最高系数并列：全部并列时差都列出，不擅选一个
+                tied = [
+                    c["lag_hours"] for c in defined
+                    if c["coefficient"] >= best - TIE_EPS
+                ]
+                conclusion, reason = "可判断", "ok"
+                best = round(best, 4)
+
+    result = {
+        "window_start": iso_utc(window_start),
+        "window_end": iso_utc(window_end),
+        "max_lag_hours": max_lag,
+        "common_pair_count": pair_count,
+        "common_upstream_hours": [iso_utc(h) for h in common_hours],
+        "conclusion": conclusion,
+        "reason": reason,
+        "candidates": candidates,
+    }
+    if conclusion == "可判断":
+        result["best_coefficient"] = best
+        result["best_lags"] = tied
+        result["is_tie"] = len(tied) > 1
+    else:
+        result["best_coefficient"] = None
+        result["best_lags"] = []
+        result["is_tie"] = False
+    return result
+
+
+REASON_TEXT = {
+    "insufficient_pairs": f"共同可配对的上游小时不足 {MIN_PAIRS} 对",
+    "no_variation": "配对序列无波动（至少一个序列为常数），皮尔逊相关系数无定义",
+    "non_positive": "所有可计算的候选时差相关系数均不大于 0，不支持正相关提前量",
+    "ok": "存在正相关最高系数的候选时差",
+}
+
+
+def lag_conclusion_text(result: dict) -> str:
+    """供网页展示的结论文案。"""
+    if result["conclusion"] == "可判断":
+        lags = "、".join(f"{lag} 小时" for lag in result["best_lags"])
+        tie = "（最高系数并列，全部列出）" if result["is_tie"] else ""
+        return (
+            f"建议候选提前量：{lags}，皮尔逊相关系数 "
+            f"{result['best_coefficient']:.4f}{tie}"
+        )
+    return "无法判断：" + REASON_TEXT[result["reason"]]

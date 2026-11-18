@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}上下游时差分析{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>预警模型候选提前量：上下游降雨时差分析</h2>
+  <form method="get" action="{{ url_for('lag_html') }}">
+    <p>
+      <label>上游雨量站
+        <input type="text" name="upstream" list="station-list" value="{{ params.upstream }}" required>
+      </label>
+      <label>下游雨量站
+        <input type="text" name="downstream" list="station-list" value="{{ params.downstream }}" required>
+      </label>
+    </p>
+    <p>
+      <label>起始整点（UTC）
+        <input type="datetime-local" name="start" step="3600" value="{{ params.start }}" required>
+      </label>
+      <label>结束整点（UTC，含）
+        <input type="datetime-local" name="end" step="3600" value="{{ params.end }}" required>
+      </label>
+    </p>
+    <p>
+      <label>最大时差（1～6 小时）
+        <input type="number" name="max_lag" min="1" max="6" step="1" value="{{ params.max_lag }}" required>
+      </label>
+      <button type="submit">分析</button>
+    </p>
+    <datalist id="station-list">
+      {% for s in stations %}<option value="{{ s }}">{% endfor %}
+    </datalist>
+  </form>
+  <p class="muted">
+    配对方式：上游小时 h 与下游延后小时 h+时差 配对；所有候选时差（0～最大时差）
+    只用<strong>共同可配对</strong>的上游小时（双方各小时均可供数）。
+    不足 8 对、任一序列无波动或最高系数不大于 0 时结论为无法判断；最高系数并列时列出全部并列时差。
+    等效 API：<code>GET /api/lag?upstream=..&amp;downstream=..&amp;start=..&amp;end=..&amp;max_lag=3</code>
+  </p>
+</div>
+
+{% if result %}
+<div class="card">
+  <h2>分析结果：{{ result.upstream_station }} → {{ result.downstream_station }}</h2>
+  <p>窗口（UTC，含起止）：{{ result.window_start }} ～ {{ result.window_end }}
+     ｜ 候选时差 0～{{ result.max_lag_hours }} 小时
+     ｜ 共同可配对上游小时：<strong>{{ result.common_pair_count }}</strong> 对</p>
+  {% if result.conclusion == "可判断" %}
+  <p><span class="badge ok">可判断</span> {{ result.conclusion_text }}</p>
+  {% else %}
+  <p><span class="badge bad">无法判断</span> {{ result.conclusion_text }}</p>
+  {% endif %}
+  <p class="muted">共同上游小时：
+    {% if result.common_upstream_hours %}
+      {{ result.common_upstream_hours | join("、") }}
+    {% else %}（无）{% endif %}
+  </p>
+
+  <table>
+    <tr>
+      <th>候选时差（小时）</th><th>皮尔逊相关系数</th><th>配对小时数</th><th>结论</th><th>配对明细</th>
+    </tr>
+    {% for c in result.candidates %}
+    <tr class="{{ 'missing' if not c.defined else '' }}">
+      <td>{{ c.lag_hours }}</td>
+      <td>
+        {% if c.defined %}
+          {{ "%.4f"|format(c.coefficient) }}
+          {% if result.best_lags and c.lag_hours in result.best_lags %}
+            <span class="badge ok">最高{{ "（并列）" if result.is_tie else "" }}</span>
+          {% endif %}
+        {% else %}
+          —
+        {% endif %}
+      </td>
+      <td>{{ c.pair_count }}</td>
+      <td>
+        {% if not c.defined and result.reason == "insufficient_pairs" %}
+          <span class="badge bad">配对不足 8 对</span>
+        {% elif not c.defined %}
+          <span class="badge bad">序列无波动，系数无定义</span>
+        {% elif c.coefficient <= 0 %}
+          <span class="badge warn">系数不大于 0</span>
+        {% elif result.best_lags and c.lag_hours in result.best_lags %}
+          <span class="badge ok">建议候选提前量</span>
+        {% else %}
+          <span class="muted">可比较</span>
+        {% endif %}
+      </td>
+      <td>
+        <details>
+          <summary>查看 {{ c.pair_count }} 个配对</summary>
+          <table style="margin-top:6px">
+            <tr><th>上游小时 (UTC)</th><th>上游 mm</th><th>下游小时 (UTC)</th><th>下游 mm</th></tr>
+            {% for p in c.pairs %}
+            <tr>
+              <td>{{ p.upstream_hour }}</td><td>{{ "%.1f"|format(p.upstream_mm) }}</td>
+              <td>{{ p.downstream_hour }}</td><td>{{ "%.1f"|format(p.downstream_mm) }}</td>
+            </tr>
+            {% endfor %}
+          </table>
+        </details>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">
+    网页与 <a href="{{ url_for('lag_api', upstream=result.upstream_station,
+        downstream=result.downstream_station, start=result.window_start,
+        end=result.window_end, max_lag=result.max_lag_hours) }}">JSON API</a>
+    使用同一计算入口，结果一致；一次查询的两站及各候选取自同一已提交状态。
+  </p>
+</div>
+{% endif %}
+{% endblock %}

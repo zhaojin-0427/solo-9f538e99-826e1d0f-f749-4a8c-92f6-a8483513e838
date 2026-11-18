@@ -48,6 +48,47 @@ def create_app(db_path: str | None = None) -> Flask:
         counters = db.fetch_hour_counters(get_conn(), station, hour_epoch)
         return core.compute_hour(counters, station, hour_epoch)
 
+    def compute_lag_result(up_station: str, down_station: str,
+                           start_epoch: int, end_epoch: int, max_lag: int) -> dict:
+        """网页与 API 共用的时差分析入口。
+
+        两站读数在同一个只读快照事务中取出，保证补传与查询交错时，
+        两站及全部候选时差都取自同一已提交状态的有效读数。
+        """
+        # 两站都只需窗口内各整点小时的雨量（计算到 window_end 那一小时，
+        # 端点覆盖到 end+1h）；下游延后配对的最大小时键恰为 window_end
+        endpoint_end = end_epoch + core.HOUR_SECONDS
+        with db.snapshot_read(get_conn()) as conn:
+            up_counters = db.fetch_range_counters(conn, up_station, start_epoch, endpoint_end)
+            down_counters = db.fetch_range_counters(conn, down_station, start_epoch, endpoint_end)
+        up_rain = core.build_hour_rainfall(up_counters, up_station, start_epoch, end_epoch)
+        down_rain = core.build_hour_rainfall(down_counters, down_station, start_epoch, end_epoch)
+        result = core.analyze_lag(up_rain, down_rain, start_epoch, end_epoch, max_lag)
+        result["upstream_station"] = up_station
+        result["downstream_station"] = down_station
+        result["conclusion_text"] = core.lag_conclusion_text(result)
+        return result
+
+    def parse_lag_params(args):
+        """解析并校验时差分析参数，返回 (up, down, start_epoch, end_epoch, max_lag)。"""
+        up = args.get("upstream", "").strip()
+        down = args.get("downstream", "").strip()
+        if not up or not down:
+            raise ValueError("请选择上游站与下游站")
+        if up == down:
+            raise ValueError("上游站与下游站必须不同")
+        start = core.parse_hour(args.get("start", ""))
+        end = core.parse_hour(args.get("end", ""))
+        if end < start:
+            raise ValueError("结束整点不能早于起始整点")
+        try:
+            max_lag = int(args.get("max_lag", "").strip(), 10)
+        except ValueError:
+            raise ValueError(f"最大时差必须为 1~{core.MAX_LAG_LIMIT} 的整数") from None
+        if not 1 <= max_lag <= core.MAX_LAG_LIMIT:
+            raise ValueError(f"最大时差必须在 1~{core.MAX_LAG_LIMIT} 小时之间")
+        return up, down, start, end, max_lag
+
     def read_upload_text():
         """从 multipart 文件或文本框读取 CSV 文本，返回 (text, filename)。"""
         file = request.files.get("file")
@@ -111,6 +152,28 @@ def create_app(db_path: str | None = None) -> Flask:
             return redirect(url_for("index"))
         return render_template("batch_detail.html", batch=batch, rows=rows)
 
+    @app.get("/lag")
+    def lag_html():
+        conn = get_conn()
+        stations = [r["station"] for r in db.list_stations(conn)]
+        params = {
+            "upstream": request.args.get("upstream", ""),
+            "downstream": request.args.get("downstream", ""),
+            "start": request.args.get("start", ""),
+            "end": request.args.get("end", ""),
+            "max_lag": request.args.get("max_lag", "3"),
+        }
+        # 没有任何查询参数时只展示表单
+        if not any(request.args.get(k) for k in ("upstream", "downstream", "start", "end", "max_lag")):
+            return render_template("lag.html", stations=stations, params=params, result=None)
+        try:
+            up, down, start, end, max_lag = parse_lag_params(request.args)
+        except ValueError as exc:
+            flash(f"查询参数无效：{exc}", "error")
+            return render_template("lag.html", stations=stations, params=params, result=None), 400
+        result = compute_lag_result(up, down, start, end, max_lag)
+        return render_template("lag.html", stations=stations, params=params, result=result)
+
     # ---------------- API（与网页同一计算入口，结果一致） ----------------
 
     @app.post("/api/upload")
@@ -133,6 +196,15 @@ def create_app(db_path: str | None = None) -> Flask:
         except ValueError as exc:
             return jsonify({"error": f"hour 参数无效: {exc}"}), 400
         return jsonify(compute_hour_result(station, hour))
+
+    @app.get("/api/lag")
+    def lag_api():
+        """上下游时差（候选提前量）分析，与网页 /lag 同一计算入口，结果一致。"""
+        try:
+            up, down, start, end, max_lag = parse_lag_params(request.args)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(compute_lag_result(up, down, start, end, max_lag))
 
     @app.get("/api/stations")
     def stations_api():
